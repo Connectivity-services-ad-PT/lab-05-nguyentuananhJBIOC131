@@ -1,31 +1,15 @@
-.PHONY: install lint build run compose-up compose-down logs test-compose
+.PHONY: compose-up compose-down logs test-compose
 
-# Install Node dependencies for Prism/Spectral/Newman
-install:
-	npm install
-
-# Lint OpenAPI contracts with Spectral
-lint:
-	npx spectral lint contracts/*.yaml
-
-# Build Docker image for API only
-build:
-	docker build -t fit4110/iot-ingestion:lab05 .
-
-# Run API container standalone (not via compose)
-run:
-	docker run --rm --name fit4110-api-lab05 -p 8000:8000 --env-file .env.example fit4110/iot-ingestion:lab05
-
-# Compose commands
 compose-up:
 	docker compose up -d --build
 
 compose-down:
-	docker compose down
+	docker compose down -v
 
 logs:
 	docker compose logs -f
 
-# Run Newman tests on compose stack
 test-compose:
-	npm run test:compose
+	npx newman run postman/collections/FIT4110_lab04_iot_docker.postman_collection.json \
+		-e postman/environments/FIT4110_lab05_local.postman_environment.json \
+		-r cli,html,xml --reporter-html-export reports/newman-lab05-compose.html

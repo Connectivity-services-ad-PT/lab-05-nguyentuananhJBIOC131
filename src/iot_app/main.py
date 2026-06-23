@@ -1,267 +1,204 @@
 import os
-from datetime import datetime, timezone
-from enum import Enum
-from typing import Dict, List, Optional
+import json
+import csv
+import time
+import logging
+from datetime import datetime
+from fastapi import FastAPI
+import paho.mqtt.client as mqtt
+from pydantic import BaseModel, ValidationError
+from typing import Optional
+from dotenv import load_dotenv
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
-from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+# --- 1. KHỞI TẠO VÀ ĐỌC CẤU HÌNH TỪ .ENV ---
+load_dotenv()
 
-# Đọc biến môi trường với giá trị mặc định
-SERVICE_NAME = os.getenv("SERVICE_NAME", "iot-ingestion")
-SERVICE_VERSION = os.getenv("SERVICE_VERSION", "0.5.0")
-AUTH_TOKEN = os.getenv("AUTH_TOKEN", "local-dev-token")
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
+app = FastAPI(title=os.getenv("SERVICE_NAME", "IoT Ingestion Service"))
 
-app = FastAPI(
-    title="FIT4110 Lab 05 - IoT Ingestion Service",
-    version=SERVICE_VERSION,
-    description=(
-        "IoT Ingestion API chạy trong ngữ cảnh Docker Compose cho Lab 05. "
-        "Luồng logic được kế thừa từ Lab 04 và tiếp tục được dùng để kiểm thử end‑to‑end."
-    ),
-)
+MQTT_HOST = os.getenv("MQTT_HOST", "26.137.61.149")
+MQTT_PORT = int(os.getenv("MQTT_PORT", 1883))
+MQTT_USERNAME = os.getenv("MQTT_USERNAME", "")
+MQTT_PASSWORD = os.getenv("MQTT_PASSWORD", "")
 
+TOPIC_RAW = "smart-campus/raw/iot/environment"
+TOPIC_EVENTS = "smart-campus/events/sensor"
 
-class SensorMetric(str, Enum):
-    temperature = "temperature"
-    humidity = "humidity"
-    motion = "motion"
-    smoke = "smoke"
+# Quản lý trạng thái
+valid_devices = set()
+mqtt_client = None
+last_status = {}
+last_normal_sent_time = {}
+THROTTLE_INTERVAL = 60
 
+# --- 2. ĐỌC DEVICE REGISTRY ---
+def load_registry():
+    try:
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        csv_path = os.path.join(current_dir, "device_registry.csv")
+        
+        with open(csv_path, mode="r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                valid_devices.add(row["device_id"])
+        logger.info(f"Đã load {len(valid_devices)} thiết bị từ registry hợp lệ.")
+    except Exception as e:
+        logger.error(f"Lỗi đọc file device_registry.csv: {e}")
 
-class SensorUnit(str, Enum):
-    celsius = "celsius"
-    percent = "percent"
-    boolean = "boolean"
-    ppm = "ppm"
-
-
-class ProblemDetails(BaseModel):
-    type: str = "about:blank"
-    title: str
-    status: int = Field(..., ge=400, le=599)
-    detail: str
-    instance: Optional[str] = None
-
-
-class HealthResponse(BaseModel):
-    status: str
-    service: str
-    version: str
-
-
-class SensorReadingCreate(BaseModel):
-    device_id: str = Field(..., min_length=3, examples=["ESP32-LAB-A01"])
-    metric: SensorMetric = Field(..., examples=["temperature"])
-    value: float = Field(
-        ...,
-        ge=-40,
-        le=80,
-        description="Boundary range used in Lab 03 và Lab 04: -40 đến 80.",
-        examples=[31.5],
-    )
-    unit: Optional[SensorUnit] = Field(default=None, examples=["celsius"])
-    timestamp: str = Field(..., examples=["2026-05-13T08:30:00+07:00"])
-
-
-class SensorReading(BaseModel):
-    reading_id: str
+# --- 3. VALIDATE SCHEMA ---
+class IoTReading(BaseModel):
+    event_id: str
+    event_type: str
     device_id: str
-    metric: SensorMetric
-    value: float
-    unit: Optional[SensorUnit] = None
-    timestamp: str
-    created_at: str
+    timestamp: datetime
+    location: str
+    temperature_c: Optional[float] = None
+    humidity_percent: Optional[float] = None
+    motion_detected: bool
+    co2_ppm: Optional[float] = None
+    smoke_ppm: Optional[float] = None
+    battery_percent: Optional[float] = None
+    scenario_hint_for_teacher: Optional[str] = None 
 
+# --- 4. LOGIC PHÂN LOẠI (CLASSIFY) ---
+def process_payload(data: IoTReading):
+    if data.device_id not in valid_devices:
+        return "invalid_device", "high", "unregistered_device_detected"
 
-class SensorReadingCreated(BaseModel):
-    reading_id: str
-    device_id: str
-    metric: SensorMetric
-    accepted: bool
-    created_at: str
+    if data.temperature_c is None or data.humidity_percent is None:
+        return "sensor_error", "high", "missing_temperature_or_humidity_data"
 
+    reasons = []
+    
+    is_danger = False
+    if data.temperature_c >= 40:
+        is_danger = True
+        reasons.append("temperature_too_high")
+    if data.co2_ppm is not None and data.co2_ppm >= 1800:
+        is_danger = True
+        reasons.append("co2_dangerous_level")
+    if data.smoke_ppm is not None and data.smoke_ppm >= 1.0:
+        is_danger = True
+        reasons.append("smoke_detected")
 
-READINGS: List[Dict] = []
+    if is_danger:
+        return "danger", "high", " | ".join(reasons)
 
+    is_warning = False
+    if data.temperature_c >= 35:
+        is_warning = True
+        reasons.append("temperature_warning")
+    if data.humidity_percent >= 85:
+        is_warning = True
+        reasons.append("high_humidity")
+    if data.co2_ppm is not None and data.co2_ppm > 1200:
+        is_warning = True
+        reasons.append("co2_warning_level")
+    if data.smoke_ppm is not None and data.smoke_ppm >= 0.5:
+        is_warning = True
+        reasons.append("smoke_warning")
+    if data.battery_percent is not None and data.battery_percent < 20:
+        is_warning = True
+        reasons.append("low_battery")
 
-def build_problem(
-    *,
-    status_code: int,
-    title: str,
-    detail: str,
-    instance: Optional[str] = None,
-    problem_type: str = "about:blank",
-) -> Dict:
-    problem = {
-        "type": problem_type,
-        "title": title,
-        "status": status_code,
-        "detail": detail,
-    }
-    if instance:
-        problem["instance"] = instance
-    return problem
+    if is_warning:
+        return "warning", "medium", " | ".join(reasons)
 
+    return "normal", "low", "environment_normal"
 
-@app.exception_handler(HTTPException)
-async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
-    if isinstance(exc.detail, dict):
-        problem = exc.detail
+# --- 5. MQTT CALLBACKS ---
+def on_connect(client, userdata, flags, rc):
+    if rc == 0:
+        logger.info(f"Kết nối Broker {MQTT_HOST} thành công!")
+        client.subscribe(TOPIC_RAW)
     else:
-        problem = build_problem(
-            status_code=exc.status_code,
-            title=status.HTTP_STATUS_CODES.get(exc.status_code, "HTTP Error"),
-            detail=str(exc.detail),
-            instance=str(request.url.path),
-        )
+        logger.error(f"Kết nối thất bại với mã lỗi {rc}")
 
-    problem.setdefault("status", exc.status_code)
-    problem.setdefault("title", status.HTTP_STATUS_CODES.get(exc.status_code, "HTTP Error"))
-    problem.setdefault("type", "about:blank")
-    problem.setdefault("detail", "Request failed")
-    problem.setdefault("instance", str(request.url.path))
+def on_message(client, userdata, msg):
+    try:
+        raw_payload = json.loads(msg.payload.decode())
+        data = IoTReading(**raw_payload)
+        status, alert_level, reason = process_payload(data)
+        
+        dev_id = data.device_id
+        current_time = time.time()
+        should_send = True
 
-    return JSONResponse(
-        status_code=exc.status_code,
-        content=problem,
-        media_type="application/problem+json",
-        headers=getattr(exc, "headers", None),
-    )
+        if dev_id not in last_status:
+            last_status[dev_id] = None
+            last_normal_sent_time[dev_id] = 0
 
+        if status == "normal":
+            if last_status[dev_id] != "normal":
+                should_send = True
+                last_normal_sent_time[dev_id] = current_time
+            else:
+                if current_time - last_normal_sent_time[dev_id] < THROTTLE_INTERVAL:
+                    should_send = False
+                else:
+                    should_send = True
+                    last_normal_sent_time[dev_id] = current_time
+        else:
+            should_send = True
 
-@app.exception_handler(RequestValidationError)
-async def validation_exception_handler(
-    request: Request, exc: RequestValidationError
-) -> JSONResponse:
-    first_error = exc.errors()[0] if exc.errors() else {}
-    location = ".".join(str(item) for item in first_error.get("loc", []))
-    message = first_error.get("msg", "Request validation error")
-    detail = f"{location}: {message}" if location else message
+        last_status[dev_id] = status
 
-    return JSONResponse(
-        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-        content=build_problem(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            title="Validation error",
-            detail=detail,
-            instance=str(request.url.path),
-            problem_type="https://smart-campus.local/problems/validation-error",
-        ),
-        media_type="application/problem+json",
-    )
+        if not should_send:
+            return
 
+        processed_event = {
+            "event_type": "sensor.reading.processed",
+            "source_service": "team-iot",
+            "raw_event_id": data.event_id,
+            "device_id": data.device_id,
+            "location": data.location,
+            "timestamp": data.timestamp.isoformat(), 
+            "temperature_c": data.temperature_c,
+            "humidity_percent": data.humidity_percent,
+            "motion_detected": data.motion_detected,
+            "co2_ppm": data.co2_ppm,
+            "smoke_ppm": data.smoke_ppm,
+            "battery_percent": data.battery_percent,
+            "status": status,
+            "alert_level": alert_level,
+            "reason": reason
+        }
+        
+        client.publish(TOPIC_EVENTS, json.dumps(processed_event))
+        logger.info(f"Đã publish sự kiện từ {dev_id} | Status: {status}")
 
-def verify_bearer_token(authorization: Optional[str] = Header(default=None)) -> None:
-    if not authorization:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=build_problem(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                title="Unauthorized",
-                detail="Missing Authorization header",
-                problem_type="https://smart-campus.local/problems/unauthorized",
-            ),
-        )
+    except ValidationError as e:
+        logger.error(f"Lỗi validate schema: {e}")
+    except Exception as e:
+        logger.error(f"Lỗi xử lý gói tin: {e}")
 
-    expected = f"Bearer {AUTH_TOKEN}"
-    if authorization != expected:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=build_problem(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                title="Unauthorized",
-                detail="Invalid bearer token",
-                problem_type="https://smart-campus.local/problems/unauthorized",
-            ),
-        )
+# --- 6. FASTAPI LẮNG NGHE ---
+@app.on_event("startup")
+def startup_event():
+    global mqtt_client
+    load_registry()
+    
+    mqtt_client = mqtt.Client()
+    if MQTT_USERNAME and MQTT_PASSWORD:
+        mqtt_client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+    
+    mqtt_client.on_connect = on_connect
+    mqtt_client.on_message = on_message
+    
+    try:
+        mqtt_client.connect(MQTT_HOST, MQTT_PORT, 60)
+        mqtt_client.loop_start() 
+    except Exception as e:
+        logger.error(f"Lỗi khởi động MQTT: {e}")
 
+@app.on_event("shutdown")
+def shutdown_event():
+    if mqtt_client:
+        mqtt_client.loop_stop()
+        mqtt_client.disconnect()
 
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def next_reading_id() -> str:
-    today = datetime.now(timezone.utc).strftime("%Y%m%d")
-    return f"R-{today}-{len(READINGS) + 1:04d}"
-
-
-@app.get("/health", response_model=HealthResponse)
-def health() -> HealthResponse:
-    return HealthResponse(
-        status="ok",
-        service=SERVICE_NAME,
-        version=SERVICE_VERSION,
-    )
-
-
-@app.post(
-    "/readings",
-    response_model=SensorReadingCreated,
-    status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(verify_bearer_token)],
-    responses={
-        401: {"model": ProblemDetails},
-        422: {"model": ProblemDetails},
-        429: {"model": ProblemDetails},
-    },
-)
-def create_reading(payload: SensorReadingCreate, response: Response) -> SensorReadingCreated:
-    # Ví dụ logic cảnh báo: nếu nhiệt độ >= 70 thì thêm header cảnh báo
-    if payload.metric == SensorMetric.temperature and payload.value >= 70:
-        response.headers["X-Warning"] = "high-temperature"
-
-    reading_id = next_reading_id()
-    created_at = now_iso()
-
-    item = {
-        "reading_id": reading_id,
-        "device_id": payload.device_id,
-        "metric": payload.metric.value,
-        "value": payload.value,
-        "unit": payload.unit.value if payload.unit else None,
-        "timestamp": payload.timestamp,
-        "created_at": created_at,
-    }
-    READINGS.append(item)
-
-    return SensorReadingCreated(
-        reading_id=reading_id,
-        device_id=payload.device_id,
-        metric=payload.metric,
-        accepted=True,
-        created_at=created_at,
-    )
-
-
-@app.get("/readings/latest", dependencies=[Depends(verify_bearer_token)])
-def latest_readings(
-    device_id: Optional[str] = Query(default=None),
-    limit: int = Query(default=10, ge=1, le=100),
-) -> Dict[str, List[Dict]]:
-    items = READINGS
-
-    if device_id:
-        items = [item for item in items if item["device_id"] == device_id]
-
-    return {"items": items[-limit:]}
-
-
-@app.get("/readings/{reading_id}", dependencies=[Depends(verify_bearer_token)])
-def get_reading(reading_id: str) -> Dict:
-    for item in READINGS:
-        if item["reading_id"] == reading_id:
-            return item
-
-    raise HTTPException(
-        status_code=status.HTTP_404_NOT_FOUND,
-        detail=build_problem(
-            status_code=status.HTTP_404_NOT_FOUND,
-            title="Not Found",
-            detail=f"Reading {reading_id} does not exist",
-            instance=f"/readings/{reading_id}",
-            problem_type="https://smart-campus.local/problems/not-found",
-        ),
-    )
+@app.get("/health")
+def health_check():
+    return {"status": "ok", "service": os.getenv("SERVICE_NAME")}
