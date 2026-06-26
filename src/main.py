@@ -98,6 +98,10 @@ def init_db():
     except Exception as e:
         logger.error(f"Lỗi khởi tạo Database: {e}")
 
+def is_valid_number(value) -> bool:
+    """Kiểm tra giá trị là số thực sự (loại trừ bool lọt qua isinstance)."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
 def classify_environment(payload: dict, is_device_valid: bool) -> tuple:
     temp = payload.get("temperature_c")
     hum = payload.get("humidity_percent")
@@ -108,7 +112,8 @@ def classify_environment(payload: dict, is_device_valid: bool) -> tuple:
     if not is_device_valid:
         return "invalid_device", "high", "device_id_not_found_in_registry"
 
-    if temp is None or hum is None or not isinstance(temp, (int, float)) or not isinstance(hum, (int, float)):
+    # FIX: dùng is_valid_number để loại trừ bool (True/False) bị nhận nhầm là số
+    if temp is None or hum is None or not is_valid_number(temp) or not is_valid_number(hum):
         return "sensor_error", "medium", "missing_or_invalid_temperature_humidity_data"
 
     reasons = []
@@ -124,19 +129,31 @@ def classify_environment(payload: dict, is_device_valid: bool) -> tuple:
     if smoke >= 0.5: reasons.append("smoke_>=_0.5")
     if batt < 20: reasons.append("battery_<_20")
     if reasons:
-        return "warning", "medium", " | ".join(reasons)
+        # FIX: đổi "medium" → "high" cho warning để nhất quán với tài liệu
+        return "warning", "high", " | ".join(reasons)
 
-    return "normal", "none", "conditions_normal"
+    # FIX: đổi "none" → "low" để Core Business không nhận giá trị ngoài schema
+    return "normal", "low", "conditions_normal"
 
 def process_mqtt_message(client, userdata, msg):
     try:
         raw_payload = json.loads(msg.payload.decode())
         
-        required_fields = ["event_id", "timestamp", "device_id", "temperature_c", "humidity_percent", "motion_detected"]
+        # FIX: thêm event_type vào required_fields theo tài liệu nghiệp vụ
+        required_fields = ["event_id", "event_type", "timestamp", "device_id", "temperature_c", "humidity_percent", "motion_detected"]
         for field in required_fields:
-            if field not in raw_payload:
-                logger.error(f"VALIDATE FAILED: Thiếu trường bắt buộc '{field}'. Đã hủy payload.")
-                return 
+            if field not in raw_payload or raw_payload[field] is None:
+                logger.error(f"VALIDATE FAILED: Thiếu hoặc null trường bắt buộc '{field}'. Đã hủy payload.")
+                return
+
+        # FIX: validate timestamp đúng ISO 8601 trước khi publish sang Core Business
+        raw_ts = raw_payload.get("timestamp", "")
+        try:
+            datetime.fromisoformat(str(raw_ts).replace("Z", "+00:00"))
+            normalized_timestamp = str(raw_ts)
+        except (ValueError, TypeError):
+            logger.error(f"VALIDATE FAILED: Timestamp '{raw_ts}' không đúng định dạng ISO 8601. Đã hủy payload.")
+            return
 
         device_id = raw_payload["device_id"]
         is_valid = check_device_in_registry(device_id)
@@ -163,7 +180,7 @@ def process_mqtt_message(client, userdata, msg):
             "status": status,
             "alert_level": alert_level,
             "reason": reason,
-            "timestamp": raw_payload.get("timestamp")
+            "timestamp": normalized_timestamp
         }
 
         client.publish(OUT_TOPIC, json.dumps(processed_event))
